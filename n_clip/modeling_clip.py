@@ -6,12 +6,18 @@ from typing import Any, Optional, Tuple, Union, List
 
 import torch
 import torch.utils.checkpoint
-from torch import nn
+from torch import Tensor, nn
 
-from ...activations import ACT2FN
-from ..modeling_outputs import ModelOutput, BaseModelOutput, BaseModelOutputWithPooling
 from .configuration_clip import n_CLIPConfig, CLIPTextConfig, CLIPVisionConfig
 
+#add more activation fns if required 
+class QuickGELUActivation(nn.Module):
+    """
+    Applies GELU approximation that is fast but somewhat inaccurate. See: https://github.com/hendrycks/GELUs
+    """
+
+    def forward(self, input: Tensor) -> Tensor:
+        return input * torch.sigmoid(1.702 * input)
 
 # Copied from transformers.models.bart.modeling_bart._expand_mask
 def _expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: Optional[int] = None):
@@ -48,34 +54,6 @@ def n_clip_loss(similarity: torch.Tensor) -> torch.Tensor:
     dim_1_loss = sum(dim_2_loss)/ len(dim_2_loss)
 
     return (dim_1_loss + dim_2_loss)  / 2.0
-
-
-@dataclass
-class n_CLIPOutput(ModelOutput):
-    """
-    Args:
-        loss (`torch.FloatTensor` of shape `(1,)`, *optional*, returned when `return_loss` is `True`):
-            Contrastive loss for image-text similarity.
-        logits_per_n: list of {(`torch.FloatTensor` of shape `(image_batch_size, text_batch_size)`):
-            The scaled dot product scores between `i_embeds` and `j_embeds`. This represents the i-j 
-            similarity scores. }
-        n_embeds: list of {(`torch.FloatTensor` of shape `(batch_size, output_dim`):
-            The embeddings obtained by applying the projection layer to the pooled output of 
-            [`CLIPTextModel`] or [`CLIPVisionModel`] }
-        n_model_output: list of {(`BaseModelOutputWithPooling`):
-            The output of the [`CLIPTextModel`] or [`CLIPVisionModel`] } 
-    """
-
-    loss: Optional[torch.FloatTensor] = None
-    logits_per_n: List = None #torch.FloatTensor = None
-    n_embeds: List = None #orch.FloatTensor = None
-    n_model_output: List = None #BaseModelOutputWithPooling = None
-
-    def to_tuple(self) -> Tuple[Any]:
-        return tuple(
-            getattr(self, k).to_tuple()
-            for k in self.keys()
-        )
 
 
 class CLIPVisionEmbeddings(nn.Module):
@@ -247,7 +225,7 @@ class CLIPMLP(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
-        self.activation_fn = ACT2FN[config.hidden_act]
+        self.activation_fn = QuickGELUActivation
         self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
         self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
 
@@ -329,8 +307,7 @@ class CLIPEncoder(nn.Module):
         causal_attention_mask: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutput]:
+    ) -> Tuple:
         r"""
         Args:
             inputs_embeds (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
@@ -357,14 +334,11 @@ class CLIPEncoder(nn.Module):
             output_hidden_states (`bool`, *optional*):
                 Whether or not to return the hidden states of all layers. See `hidden_states` under returned tensors
                 for more detail.
-            return_dict (`bool`, *optional*):
-                Whether or not to return a [`~utils.ModelOutput`] instead of a plain tuple.
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         encoder_states = () if output_hidden_states else None
         all_attentions = () if output_attentions else None
@@ -403,11 +377,7 @@ class CLIPEncoder(nn.Module):
         if output_hidden_states:
             encoder_states = encoder_states + (hidden_states,)
 
-        if not return_dict:
-            return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
-        return BaseModelOutput(
-            last_hidden_state=hidden_states, hidden_states=encoder_states, attentions=all_attentions
-        )
+        return tuple(v for v in [hidden_states, encoder_states, all_attentions] if v is not None)
 
 
 class CLIPTextTransformer(nn.Module):
@@ -426,8 +396,7 @@ class CLIPTextTransformer(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+    ) -> Tuple:
         r"""
         Returns:
 
@@ -436,7 +405,6 @@ class CLIPTextTransformer(nn.Module):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if input_ids is None:
             raise ValueError("You have to specify either input_ids")
@@ -463,7 +431,6 @@ class CLIPTextTransformer(nn.Module):
             causal_attention_mask=causal_attention_mask,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
 
         last_hidden_state = encoder_outputs[0]
@@ -476,15 +443,8 @@ class CLIPTextTransformer(nn.Module):
             torch.arange(last_hidden_state.shape[0], device=input_ids.device), input_ids.to(torch.int).argmax(dim=-1)
         ]
 
-        if not return_dict:
-            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
+        return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
-        return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooled_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-        )
 
     def _build_causal_attention_mask(self, bsz, seq_len, dtype):
         # lazily create causal attention mask, with full attention between the vision tokens
@@ -520,8 +480,7 @@ class CLIPTextModel(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+    ) -> Tuple:
         r"""
         Returns:
 
@@ -545,7 +504,6 @@ class CLIPTextModel(nn.Module):
             position_ids=position_ids,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
 
 
@@ -565,8 +523,7 @@ class CLIPVisionTransformer(nn.Module):
         pixel_values: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+    ) -> Tuple:
         r"""
         Returns:
 
@@ -575,7 +532,6 @@ class CLIPVisionTransformer(nn.Module):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
         if pixel_values is None:
             raise ValueError("You have to specify pixel_values")
@@ -587,22 +543,14 @@ class CLIPVisionTransformer(nn.Module):
             inputs_embeds=hidden_states,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
 
         last_hidden_state = encoder_outputs[0]
         pooled_output = last_hidden_state[:, 0, :]
         pooled_output = self.post_layernorm(pooled_output)
 
-        if not return_dict:
-            return (last_hidden_state, pooled_output) + encoder_outputs[1:]
+        return (last_hidden_state, pooled_output) + encoder_outputs[1:]
 
-        return BaseModelOutputWithPooling(
-            last_hidden_state=last_hidden_state,
-            pooler_output=pooled_output,
-            hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-        )
 
 
 class CLIPVisionModel(nn.Module):
@@ -623,8 +571,7 @@ class CLIPVisionModel(nn.Module):
         pixel_values: Optional[torch.FloatTensor] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, BaseModelOutputWithPooling]:
+    ) -> Tuple:
         r"""
         Returns:
 
@@ -651,7 +598,6 @@ class CLIPVisionModel(nn.Module):
             pixel_values=pixel_values,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
         )
 
 class n_CLIPModel(nn.Module):
@@ -691,8 +637,7 @@ class n_CLIPModel(nn.Module):
         return_loss: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
-        return_dict: Optional[bool] = None,
-    ) -> Union[Tuple, n_CLIPOutput]:
+    ) -> Tuple:
         r"""
         Returns:
 
@@ -722,7 +667,6 @@ class n_CLIPModel(nn.Module):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
         n_outputs = []
         for n_mod in self.n_model: 
             if isinstance(n_mod, CLIPVisionTransformer):
@@ -730,7 +674,6 @@ class n_CLIPModel(nn.Module):
                     pixel_values=pixel_values,
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
-                    return_dict=return_dict,
                 ))
             else: 
                 n_outputs.append(n_mod(
@@ -739,7 +682,6 @@ class n_CLIPModel(nn.Module):
                     position_ids=position_ids,
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
-                    return_dict=return_dict,
                 ) ) 
                 
         n_embeds = []
@@ -760,13 +702,7 @@ class n_CLIPModel(nn.Module):
         if return_loss:
             loss = n_clip_loss(logits_per_n)
 
-        if not return_dict:
-            output = (logits_per_n, n_embeds, n_outputs)
-            return ((loss,) + output) if loss is not None else output
 
-        return n_CLIPOutput(
-            loss=loss,
-            logits_per_n=logits_per_n,
-            n_embeds=n_embeds,
-            n_model_output=n_outputs,
-                 )
+        output = (logits_per_n, n_embeds, n_outputs)
+        return ((loss,) + output) if loss is not None else output
+
