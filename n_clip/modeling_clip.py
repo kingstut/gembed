@@ -1,4 +1,4 @@
-""" PyTorch CLIP model."""
+""" PyTorch n_CLIP model."""
 
 
 from dataclasses import dataclass
@@ -630,11 +630,10 @@ class n_CLIPModel(nn.Module):
 
     def forward(
         self,
-        input_ids: Optional[torch.LongTensor] = None,
-        pixel_values: Optional[torch.FloatTensor] = None,
+        input_ids = None, #list of torch.LongTensor
+        pixel_values =  None, #list of torch.LongTensor
         attention_mask: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        return_loss: Optional[bool] = None,
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
     ) -> Tuple:
@@ -646,21 +645,27 @@ class n_CLIPModel(nn.Module):
         ```python
         >>> from PIL import Image
         >>> import requests
-        >>> from transformers import n_CLIPProcessor, n_CLIPModel
+        >>> from transformers import CLIPTokenizer
+        >>> from gembed import n_CLIPModel
 
         >>> model = n_CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        >>> processor = n_CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+
+        >>> processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
 
         >>> url = "http://images.cocodataset.org/val2017/000000039769.jpg"
-        >>> image = Image.open(requests.get(url, stream=True).raw)
+        >>> image1 = Image.open(requests.get(url, stream=True).raw)
+        >>> image1_inputs = processor(images=image1, return_tensors="pt")
 
-        >>> inputs = processor(
-        ...     text=["a photo of a cat", "a photo of a dog"], images=image, return_tensors="pt", padding=True
-        ... )
+        >>> url = "http://images.cocodataset.org/val2017/000000039770.jpg"
+        >>> image2 = Image.open(requests.get(url, stream=True).raw)
+        >>> image2_inputs = processor(images=image2, return_tensors="pt")
 
-        >>> outputs = model(**inputs)
-        >>> logits_per_image = outputs.logits_per_image  # this is the image-text similarity score
-        >>> probs = logits_per_image.softmax(dim=1)  # we can take the softmax to get the label probabilities
+        >>> image_inputs = [image1_inputs, image2_inputs]
+
+        >>> tokenizer = CLIPTokenizer.from_pretrained("openai/clip-vit-base-patch32")
+        >>> text_inputs = tokenizer(["a photo of a cat", "a photo of a dog"], padding=True, return_tensors="pt")
+
+        >>> outputs = model([text_inputs], image_inputs)
         ```"""
         # Use CLIP model's config for some fields (if specified) instead of those of vision & text components.
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
@@ -671,13 +676,13 @@ class n_CLIPModel(nn.Module):
         for n_mod in self.n_model: 
             if isinstance(n_mod, CLIPVisionTransformer):
                 n_outputs.append(n_mod(
-                    pixel_values=pixel_values,
+                    pixel_values=pixel_values.pop(0),
                     output_attentions=output_attentions,
                     output_hidden_states=output_hidden_states,
                 ))
             else: 
                 n_outputs.append(n_mod(
-                    input_ids=input_ids,
+                    input_ids=input_ids.pop(0),
                     attention_mask=attention_mask,
                     position_ids=position_ids,
                     output_attentions=output_attentions,
@@ -686,6 +691,7 @@ class n_CLIPModel(nn.Module):
                 
         n_embeds = []
         for i, output in enumerate(n_outputs): 
+            
             embeds = output[1]
             embeds = self.n_projection[i](embeds)
             n_embeds.append(embeds)
@@ -695,14 +701,10 @@ class n_CLIPModel(nn.Module):
 
         # cosine similarity as logits
         logit_scale = self.logit_scale.exp()
-        logits_per_n = torch.outer(n_embeds) * logit_scale 
+        logits_per_n = []
+        for i in range(1, n_outputs):
+            logits_per_n.append( torch.matmul(n_embeds[i], n_embeds[0].t()) * logit_scale )
         #FIXME torch.matmul(text_embeds, image_embeds.t()) * logit_scale
 
-        loss = None
-        if return_loss:
-            loss = n_clip_loss(logits_per_n)
-
-
-        output = (logits_per_n, n_embeds, n_outputs)
-        return ((loss,) + output) if loss is not None else output
-
+        loss = sum([n_clip_loss(logit) for logit in logits_per_n])
+        return loss 
